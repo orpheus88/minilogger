@@ -1,217 +1,271 @@
-/*************************************************************************
-* Arduino OBD-II/G-Force Data Logger and Transmitter
-* Distributed under GPL v2.0
-* Copyright (c) 2013-14 Stanley Huang <stanleyhuangyc@gmail.com>
-* All rights reserved.
-*************************************************************************/
+#define FORMAT_BIN 0
+#define FORMAT_CSV 1
 
-#include <Arduino.h>
-#include <OBD.h>
-#include <SD.h>
-#include <Wire.h>
-#include <SPI.h>
-#include "config.h"
+typedef struct {
+    uint32_t time;
+    uint16_t pid;
+    uint8_t flags;
+    uint8_t checksum;
+    float value;
+} LOG_DATA;
 
-#include "datalogger.h"
+typedef struct {
+    uint32_t time;
+    uint16_t pid;
+    uint8_t flags;
+    uint8_t checksum;
+    float value[3];
+} LOG_DATA_COMM;
 
-// logger states
-#define STATE_SD_READY 0x1
-#define STATE_OBD_READY 0x2
-#define STATE_GPS_FOUND 0x4
-#define STATE_GPS_READY 0x8
-#define STATE_ACC_READY 0x10
-#define STATE_SLEEPING 0x20
+typedef struct {
+    uint32_t time; /* e.g. 1307281259 */
+    uint16_t pid;
+    uint8_t message;
+    uint8_t checksum;
+    uint16_t fileIndex;
+    uint16_t fileSize; /* KB */
+    uint16_t logFlags;
+    uint8_t logType;
+    uint8_t data[5];
+} LOG_DATA_FILE_INFO;
 
-static uint16_t lastFileSize = 0;
-static uint16_t fileIndex = 0;
-static uint32_t startTime = 0;
-static uint16_t elapsed = 0;
+typedef struct {
+    uint32_t time;
+    uint16_t pid;
+    uint8_t message;
+    uint8_t checksum;
+    uint8_t data[12];
+} LOG_DATA_COMMAND;
 
-static byte pidTier1[]= {PID_RPM, PID_SPEED, PID_ENGINE_LOAD, PID_THROTTLE};
-static byte pidTier2[] = {PID_TIMING_ADVANCE};
-static byte pidTier3[] = {PID_COOLANT_TEMP, PID_INTAKE_TEMP, PID_AMBIENT_TEMP, PID_FUEL_LEVEL, PID_BAROMETRIC, PID_DISTANCE, PID_RUNTIME};
+typedef struct {
+    uint32_t id;
+    uint32_t dataOffset;
+    uint8_t ver;
+    uint8_t logType;
+    uint16_t flags;
+    uint32_t dateTime; //4, YYMMDDHHMM, e.g. 1305291359
+    /*
+    uint8_t devid[8];
+    uint8_t vin[24];
+    uint8_t unused[84];
+    */
+} HEADER;
 
-#define TIER_NUM1 sizeof(pidTier1)
-#define TIER_NUM2 sizeof(pidTier2)
-#define TIER_NUM3 sizeof(pidTier3)
+#define HEADER_LEN 128 /* bytes */
 
-class COBDLogger : public COBD, public CDataLogger
-{
+#define PID_GPS_COORDINATES 0xF00A
+#define PID_GPS_ALTITUDE 0xF00C
+#define PID_GPS_SPEED 0xF00D
+#define PID_GPS_HEADING 0xF00E
+#define PID_GPS_SAT_COUNT 0xF00F
+#define PID_GPS_TIME 0xF010
+
+#define PID_ACC 0xF020
+#define PID_GYRO 0xF021
+
+#if LOG_FORMAT == FORMAT_BIN
+#define FILE_NAME_FORMAT "/DAT%05d.LOG"
+#else
+#define FILE_NAME_FORMAT "/DAT%05d.CSV"
+#endif
+
+
+class CDataLogger {
 public:
-    COBDLogger():state(0) {}
-    void setup()
+    void initSender()
     {
-        showStates();
-
-        for (byte n = 0; n < 3; n++) {
-            if (init()) {
-                state |= STATE_OBD_READY;
-                showStates();
-                break;
-            }
-            showStates();
-        }
-
-
-#if ENABLE_DATA_LOG
-        uint16_t index = openFile();
-
-        // open file for logging
-        if (!(state & STATE_SD_READY)) {
-            if (checkSD()) {
-                state |= STATE_SD_READY;
-                showStates();
-            }
-        }
+#if ENABLE_DATA_LOG && LOG_FORMAT == FORMAT_CSV
+        m_lastDataTime = 0;
 #endif
-        showECUCap();
-        startTime = millis();
     }
-    void loop()
+    void logData(char c)
     {
-//        logGPSData();
-
-        if (!(state & STATE_OBD_READY)) {
-            if (millis() - startTime > 10000) {
-            // try reconnecting OBD-II
-            if (init()) {
-                state |= STATE_OBD_READY;
-                showStates();
-            }
-            startTime = millis();
-            }
-            return;
-        }
-
-        static byte index = 0;
-        static byte index2 = 0;
-        static byte index3 = 0;
-
-        logOBDData(pidTier1[index++]);
-        if (index == TIER_NUM1) {
-            index = 0;
-            if (index2 == TIER_NUM2) {
-                index2 = 0;
-                logOBDData(pidTier3[index3]);
-                index3 = (index3 + 1) % TIER_NUM3;
-            } else {
-                logOBDData(pidTier2[index2++]);
-            }
-        }
-        if (errors >= 5) {
-            reconnect();
-        }
+#if ENABLE_DATA_LOG
+        if (sdfile) dataSize += sdfile.write(c);
+#endif
+    }
+    void logData(uint16_t pid, int value)
+    {
+#if LOG_FORMAT == FORMAT_BIN || STREAM_FORMAT == FORMAT_BIN
+        LOG_DATA_COMM ld = {dataTime, pid, 1, 0, value};
+        ld.checksum = getChecksum((char*)&ld, 12);
+#endif
+#if ENABLE_DATA_LOG
+        if (!sdfile) return;
+#if LOG_FORMAT == FORMAT_BIN
+        sdfile.write((uint8_t*)&ld, 12);
+        dataSize += 12;
+#else
+        dataSize += sdfile.print(dataTime - m_lastDataTime);
+        sdfile.write(',');
+        dataSize += sdfile.print(pid, HEX);
+        sdfile.write(',');
+        dataSize += sdfile.print(value);
+        sdfile.write('\n');
+        dataSize += 3;
+        m_lastDataTime = dataTime;
+#endif
+#endif
+    }
+    void logData(uint16_t pid, float value)
+    {
+#if LOG_FORMAT == FORMAT_BIN || STREAM_FORMAT == FORMAT_BIN
+        LOG_DATA_COMM ld = {dataTime, pid, 1, 0, value};
+        ld.checksum = getChecksum((char*)&ld, 12);
+#endif
+#if ENABLE_DATA_LOG
+        if (!sdfile) return;
+#if LOG_FORMAT == FORMAT_BIN
+        sdfile.write((uint8_t*)&ld, 12);
+        dataSize += 12;
+#else
+        dataSize += sdfile.print(dataTime - m_lastDataTime);
+        sdfile.write(',');
+        dataSize += sdfile.print(pid, HEX);
+        sdfile.write(',');
+        dataSize += sdfile.print(value);
+        sdfile.write('\n');
+        dataSize += 3;
+        m_lastDataTime = dataTime;
+#endif
+#endif
+    }
+    void logData(uint16_t pid, float value1, float value2)
+    {
+#if LOG_FORMAT == FORMAT_BIN || STREAM_FORMAT == FORMAT_BIN
+        LOG_DATA_COMM ld = {dataTime, pid, 2, 0, {value1, value2}};
+        ld.checksum = getChecksum((char*)&ld, 16);
+#endif
+#if ENABLE_DATA_LOG
+        if (!sdfile) return;
+#if LOG_FORMAT == FORMAT_BIN
+        sdfile.write((uint8_t*)&ld, 16);
+        dataSize += 16;
+#else
+        dataSize += sdfile.print(dataTime - m_lastDataTime);
+        sdfile.write(',');
+        dataSize += sdfile.print(pid, HEX);
+        sdfile.write(',');
+        dataSize += sdfile.print(value1, 6);
+        sdfile.write(',');
+        dataSize += sdfile.print(value2, 6);
+        sdfile.write('\n');
+        dataSize += 4;
+        m_lastDataTime = dataTime;
+#endif
+#endif
+    }
+    void logData(uint16_t pid, uint32_t value1, uint32_t value2)
+    {
+#if LOG_FORMAT == FORMAT_BIN || STREAM_FORMAT == FORMAT_BIN
+        LOG_DATA_COMM ld = {dataTime, pid, 2, 0, {value1, value2}};
+        ld.checksum = getChecksum((char*)&ld, 16);
+#endif
+#if ENABLE_DATA_LOG
+        if (!sdfile) return;
+#if LOG_FORMAT == FORMAT_BIN
+        sdfile.write((uint8_t*)&ld, 16);
+        dataSize += 16;
+#else
+        dataSize += sdfile.print(dataTime - m_lastDataTime);
+        sdfile.write(',');
+        dataSize += sdfile.print(pid, HEX);
+        sdfile.write(',');
+        dataSize += sdfile.print(value1);
+        sdfile.write(',');
+        dataSize += sdfile.print(value2);
+        sdfile.write('\n');
+        dataSize += 4;
+        m_lastDataTime = dataTime;
+#endif
+#endif
+    }
+    void logData(uint16_t pid, int value1, int value2, int value3)
+    {
+#if LOG_FORMAT == FORMAT_BIN || STREAM_FORMAT == FORMAT_BIN
+        LOG_DATA_COMM ld = {dataTime, pid, 3, 0, {value1, value2, value3}};
+        ld.checksum = getChecksum((char*)&ld, 20);
+#endif
+#if ENABLE_DATA_LOG
+        if (!sdfile) return;
+#if LOG_FORMAT == FORMAT_BIN
+        sdfile.write((uint8_t*)&ld, 20);
+        dataSize += 20;
+#else
+        dataSize += sdfile.print(dataTime - m_lastDataTime);
+        sdfile.write(',');
+        dataSize += sdfile.print(pid, HEX);
+        sdfile.write(',');
+        dataSize += sdfile.print(value1);
+        sdfile.write(',');
+        dataSize += sdfile.print(value2);
+        sdfile.write(',');
+        dataSize += sdfile.print(value3);
+        sdfile.write('\n');
+        dataSize += 5;
+        m_lastDataTime = dataTime;
+#endif
+#endif
     }
 #if ENABLE_DATA_LOG
-    bool checkSD()
+    uint16_t openFile(uint16_t logFlags = 0, uint32_t dateTime = 0)
     {
-        Sd2Card card;
-        SdVolume volume;
-        state &= ~STATE_SD_READY;
-        pinMode(SS, OUTPUT);
-        if (card.init(SPI_HALF_SPEED, SD_CS_PIN)) {
-            if (!volume.init(card)) {
-                return false;
+        uint16_t fileIndex;
+        char filename[24] = "/FRMATICS";
+
+        if (SD.exists(filename)) {
+            for (fileIndex = 1; fileIndex; fileIndex++) {
+                sprintf(filename + 9, FILE_NAME_FORMAT, fileIndex);
+                if (!SD.exists(filename)) {
+                    break;
+                }
             }
-            uint32_t volumesize = volume.blocksPerCluster();
-            volumesize >>= 1; // 512 bytes per block
-            volumesize *= volume.clusterCount();
-            volumesize >>= 10;
+            if (fileIndex == 0)
+                return 0;
         } else {
-            return false;
+            SD.mkdir(filename);
+            fileIndex = 1;
+            sprintf(filename + 9, FILE_NAME_FORMAT, 1);
         }
 
-        if (!SD.begin(SD_CS_PIN)) {
-            return false;
+        sdfile = SD.open(filename, FILE_WRITE);
+        if (!sdfile) {
+            return 0;
         }
 
-        state |= STATE_SD_READY;
-        return true;
+#if LOG_FORMAT == FORMAT_BIN
+        HEADER hdr = {'UDUS', HEADER_LEN, 1, 0, logFlags, dateTime};
+        sdfile.write((uint8_t*)&hdr, sizeof(hdr));
+        for (byte i = 0; i < HEADER_LEN - sizeof(hdr); i++)
+            sdfile.write((uint8_t)0);
+        dataSize = HEADER_LEN;
+#endif
+        return fileIndex;
+    }
+    void closeFile()
+    {
+        sdfile.close();
+    }
+    void flushFile()
+    {
+        if (sdfile) sdfile.flush();
     }
 #endif
+    uint32_t dataTime;
+    uint32_t dataSize;
 private:
-    void logOBDData(byte pid)
+    byte getChecksum(char* buffer, byte len)
     {
-        int value;
-
-        // send a query command
-        sendQuery(pid);
-
-        pid = 0; // this lets PID also get from response
-        // receive and parse the response
-        if (getResult(pid, value)) {
-            dataTime = millis();
-            showData(pid, value);
-            // log data to SD card
-            logData(0x100 | pid, value);
-            errors = 0;
-        } else {
-            errors++;
-            return;
+        uint8_t checksum = 0;
+        for (byte i = 0; i < len; i++) {
+          checksum ^= buffer[i];
         }
+        return checksum;
     }
-    void showECUCap()
-    {
-#if VERBOSE
-        byte pidlist[] = {PID_RPM, PID_SPEED, PID_THROTTLE, PID_ENGINE_LOAD, PID_CONTROL_MODULE_VOLTAGE, PID_MAF_FLOW, PID_INTAKE_MAP, PID_FUEL_LEVEL, PID_FUEL_PRESSURE, PID_COOLANT_TEMP, PID_INTAKE_TEMP, PID_AMBIENT_TEMP, PID_TIMING_ADVANCE, PID_BAROMETRIC};
-        const char* namelist[] = {"RPM", "SPEED", "THROTTLE", "ENG.LOAD", "CTRL VOLT", "MAF", "MAP", "FUEL LV.", "FUEL PRE.", "COOLANT", "INTAKE","AMBIENT", "IGNITION", "BARO"};
-        for (byte i = 0; i < sizeof(pidlist) / sizeof(pidlist[0]); i++) {
-            SerialInfo.print(namelist[i]);
-            SerialInfo.print(':');
-            SerialInfo.println(isValidPID(pidlist[i]) ? 'Yes' : 'No');
-        }
-#endif
-    }
-    void reconnect()
-    {
 #if ENABLE_DATA_LOG
-        closeFile();
+    File sdfile;
+#if LOG_FORMAT == FORMAT_CSV
+    uint32_t m_lastDataTime;
 #endif
-        startTime = millis();
-        state &= ~(STATE_OBD_READY | STATE_ACC_READY);
-        state |= STATE_SLEEPING;
-        //digitalWrite(SD_CS_PIN, LOW);
-        for (int i = 1; !init(); i++) {
-        }
-        state &= ~STATE_SLEEPING;
-        fileIndex++;
-        setup();
-    }
-    byte state;
-
-    // screen layout related stuff
-    void showStates()
-    {
-    }
-    void showData(byte pid, int value)
-    {
-    }
-    void dataIdleLoop()
-    {
-#if ENABLE_DATA_LOG
-        // flush SD data every 1KB
-        if ((uint16_t)dataSize - lastFileSize >= 1024) {
-            flushFile();
-            lastFileSize = (uint16_t)dataSize;
-        }
 #endif
-    }
 };
-
-static COBDLogger logger;
-
-void setup()
-{
-    logger.begin();
-    logger.initSender();
-
-#if ENABLE_DATA_LOG
-    logger.checkSD();
-#endif
-    logger.setup();
-}
-
-void loop()
-{
-    logger.loop();
-}

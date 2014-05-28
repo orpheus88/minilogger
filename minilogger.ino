@@ -28,8 +28,13 @@ static uint32_t startTime = 0;
 static uint16_t elapsed = 0;
 
 static byte pidTier1[]= {PID_RPM, PID_SPEED, PID_ENGINE_LOAD, PID_THROTTLE};
-static byte pidTier2[] = {PID_TIMING_ADVANCE};
-static byte pidTier3[] = {PID_COOLANT_TEMP, PID_INTAKE_TEMP, PID_AMBIENT_TEMP, PID_FUEL_LEVEL, PID_BAROMETRIC, PID_DISTANCE, PID_RUNTIME};
+static byte pidTier2[] = {PID_DISTANCE, PID_RUNTIME, PID_INTAKE_TEMP};
+static byte pidTier3[] = {PID_COOLANT_TEMP, PID_AMBIENT_TEMP,PID_TIMING_ADVANCE,};
+
+//static byte pidTier1[]= {PID_FUEL_PRESSURE,PID_MAF_FLOW,PID_ENGINE_TORQUE_PERCENTAGE};
+//static byte pidTier2[] = {PID_RUNTIME,PID_FUEL_LEVEL,PID_ETHANOL_PERCENTAGE,PID_FUEL_RAIL_PRESSURE};
+//static byte pidTier3[] = {PID_ENGINE_FUEL_RATE,PID_ENGINE_REF_TORQUE};
+
 
 #define TIER_NUM1 sizeof(pidTier1)
 #define TIER_NUM2 sizeof(pidTier2)
